@@ -32,6 +32,13 @@ public class TherapistUIController : MonoBehaviour
             sessionDateField.text = DateTime.Now.ToString("yyyy-MM-dd");
     }
 
+    private enum StatusType { Info, Success, Error }
+
+    [Header("Status Colors")]
+    [SerializeField] private Color infoColor = Color.white;
+    [SerializeField] private Color successColor = Color.green;
+    [SerializeField] private Color errorColor = Color.red;
+
     private void OnStartSessionClicked()
     {
         string patientName = patientNameField.text.Trim();
@@ -40,7 +47,7 @@ public class TherapistUIController : MonoBehaviour
 
         if (string.IsNullOrEmpty(patientName) || string.IsNullOrEmpty(therapistName) || string.IsNullOrEmpty(sessionDate))
         {
-            SetStatus("Enter patient name, therapist name, and date before starting.");
+            SetStatus("Enter patient name, therapist name, and date before starting.", StatusType.Error);
             return;
         }
 
@@ -51,7 +58,7 @@ public class TherapistUIController : MonoBehaviour
             sessionDate = sessionDate
         };
 
-        SetStatus("Sending session info to VR app...");
+        SetStatus("Sending session info to VR app...", StatusType.Info);
         startSessionButton.interactable = false;
 
         vrAppClient.SendSessionInfo(info, (success, message) =>
@@ -59,33 +66,42 @@ public class TherapistUIController : MonoBehaviour
             startSessionButton.interactable = true;
             if (success)
             {
-                SetStatus("Session started. Waiting for it to finish, then fetch results.");
+                SetStatus("Session started. Waiting for it to finish, then fetch results.", StatusType.Success);
                 fetchResultsButton.interactable = true;
             }
             else
             {
-                SetStatus($"Failed to reach VR app: {message}");
+                SetStatus($"Failed to reach VR app: {message}", StatusType.Error);
             }
         });
     }
 
     private void OnFetchResultsClicked()
     {
-        SetStatus("Fetching session results...");
+        SetStatus("Fetching session results...", StatusType.Info);
         fetchResultsButton.interactable = false;
 
         string exportPath = Path.Combine(Application.persistentDataPath, exportFolderName);
         vrAppClient.RequestSessionCsv(exportPath, (success, result) =>
         {
             fetchResultsButton.interactable = true;
-            SetStatus(success ? $"Saved results to: {result}" : $"Failed to fetch results: {result}");
+            SetStatus(success ? $"Saved results to: {result}" : $"Failed to fetch results: {result}",
+                success ? StatusType.Success : StatusType.Error);
         });
     }
 
-    private void SetStatus(string message)
+    private void SetStatus(string message, StatusType type = StatusType.Info)
     {
         if (statusText != null)
+        {
             statusText.text = message;
+            statusText.color = type switch
+            {
+                StatusType.Success => successColor,
+                StatusType.Error => errorColor,
+                _ => infoColor
+            };
+        }
 
         Debug.Log($"[TherapistUIController] {message}");
     }
