@@ -21,6 +21,8 @@ public class TherapistUIController : MonoBehaviour
 
     [Header("Export")]
     [SerializeField] private string exportFolderName = "SessionExports";
+    [SerializeField] private TMP_InputField saveFolderPathField;
+    [SerializeField] private Button browseFolderButton;
 
     private void Awake()
     {
@@ -28,8 +30,14 @@ public class TherapistUIController : MonoBehaviour
         fetchResultsButton.onClick.AddListener(OnFetchResultsClicked);
         fetchResultsButton.interactable = false;
 
+        if (browseFolderButton != null)
+            browseFolderButton.onClick.AddListener(OnBrowseFolderClicked);
+
         if (sessionDateField != null && string.IsNullOrEmpty(sessionDateField.text))
             sessionDateField.text = DateTime.Now.ToString("yyyy-MM-dd");
+
+        if (saveFolderPathField != null && string.IsNullOrEmpty(saveFolderPathField.text))
+            saveFolderPathField.text = Path.Combine(Application.persistentDataPath, exportFolderName);
     }
 
     private enum StatusType { Info, Success, Error }
@@ -81,13 +89,33 @@ public class TherapistUIController : MonoBehaviour
         SetStatus("Fetching session results...", StatusType.Info);
         fetchResultsButton.interactable = false;
 
-        string exportPath = Path.Combine(Application.persistentDataPath, exportFolderName);
+        string exportPath = saveFolderPathField != null && !string.IsNullOrWhiteSpace(saveFolderPathField.text)
+            ? saveFolderPathField.text.Trim()
+            : Path.Combine(Application.persistentDataPath, exportFolderName);
+
         vrAppClient.RequestSessionCsv(exportPath, (success, result) =>
         {
             fetchResultsButton.interactable = true;
             SetStatus(success ? $"Saved results to: {result}" : $"Failed to fetch results: {result}",
                 success ? StatusType.Success : StatusType.Error);
         });
+    }
+
+    private void OnBrowseFolderClicked()
+    {
+#if UNITY_EDITOR
+        string startingPath = saveFolderPathField != null && !string.IsNullOrWhiteSpace(saveFolderPathField.text)
+            ? saveFolderPathField.text.Trim()
+            : Application.persistentDataPath;
+
+        string selected = UnityEditor.EditorUtility.OpenFolderPanel("Choose Save Folder", startingPath, "");
+        if (!string.IsNullOrEmpty(selected) && saveFolderPathField != null)
+        {
+            saveFolderPathField.text = selected;
+        }
+#else
+        SetStatus("Folder browsing is only available in the Unity Editor. Type or paste a folder path above instead.", StatusType.Info);
+#endif
     }
 
     private void SetStatus(string message, StatusType type = StatusType.Info)
