@@ -14,6 +14,7 @@ public class TherapistUIController : MonoBehaviour
     [Header("Controls")]
     [SerializeField] private Button startSessionButton;
     [SerializeField] private Button fetchResultsButton;
+    [SerializeField] private Button exitButton;
     [SerializeField] private TMP_Text statusText;
 
     [Header("Networking")]
@@ -29,6 +30,9 @@ public class TherapistUIController : MonoBehaviour
         startSessionButton.onClick.AddListener(OnStartSessionClicked);
         fetchResultsButton.onClick.AddListener(OnFetchResultsClicked);
         fetchResultsButton.interactable = false;
+
+        if (exitButton != null)
+            exitButton.onClick.AddListener(OnExitClicked);
 
         if (browseFolderButton != null)
             browseFolderButton.onClick.AddListener(OnBrowseFolderClicked);
@@ -99,6 +103,15 @@ public class TherapistUIController : MonoBehaviour
             SetStatus(success ? $"Saved results to: {result}" : $"Failed to fetch results: {result}",
                 success ? StatusType.Success : StatusType.Error);
         });
+    }
+
+    private void OnExitClicked()
+    {
+        Debug.Log("[TherapistUIController] Exit requested — closing application.");
+        Application.Quit();
+#if UNITY_EDITOR
+        UnityEditor.EditorApplication.isPlaying = false;
+#endif
     }
 
     private void OnBrowseFolderClicked()
