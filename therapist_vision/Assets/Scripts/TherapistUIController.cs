@@ -16,6 +16,7 @@ public class TherapistUIController : MonoBehaviour
     [SerializeField] private Button fetchResultsButton;
     [SerializeField] private Button exitButton;
     [SerializeField] private TMP_Text statusText;
+    [SerializeField] private TMP_Text platformInfoText;
 
     [Header("Networking")]
     [SerializeField] private VRAppClient vrAppClient;
@@ -42,6 +43,14 @@ public class TherapistUIController : MonoBehaviour
 
         if (saveFolderPathField != null && string.IsNullOrEmpty(saveFolderPathField.text))
             saveFolderPathField.text = Path.Combine(Application.persistentDataPath, exportFolderName);
+
+        // Small on-screen readout so it's obvious which OS a given build is actually
+        // running as during cross-platform testing with real headsets — no need to dig
+        // through logs or remember which machine you're looking at.
+        string platformInfo = $"Running on: {SystemInfo.operatingSystem} ({Application.platform})";
+        if (platformInfoText != null)
+            platformInfoText.text = platformInfo;
+        Debug.Log($"[TherapistUIController] {platformInfo}");
     }
 
     private enum StatusType { Info, Success, Error }
