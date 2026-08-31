@@ -14,7 +14,9 @@ public class TherapistUIController : MonoBehaviour
     [Header("Controls")]
     [SerializeField] private Button startSessionButton;
     [SerializeField] private Button fetchResultsButton;
+    [SerializeField] private Button exitButton;
     [SerializeField] private TMP_Text statusText;
+    [SerializeField] private TMP_Text platformInfoText;
 
     [Header("Networking")]
     [SerializeField] private VRAppClient vrAppClient;
@@ -30,6 +32,9 @@ public class TherapistUIController : MonoBehaviour
         fetchResultsButton.onClick.AddListener(OnFetchResultsClicked);
         fetchResultsButton.interactable = false;
 
+        if (exitButton != null)
+            exitButton.onClick.AddListener(OnExitClicked);
+
         if (browseFolderButton != null)
             browseFolderButton.onClick.AddListener(OnBrowseFolderClicked);
 
@@ -38,6 +43,14 @@ public class TherapistUIController : MonoBehaviour
 
         if (saveFolderPathField != null && string.IsNullOrEmpty(saveFolderPathField.text))
             saveFolderPathField.text = Path.Combine(Application.persistentDataPath, exportFolderName);
+
+        // Small on-screen readout so it's obvious which OS a given build is actually
+        // running as during cross-platform testing with real headsets — no need to dig
+        // through logs or remember which machine you're looking at.
+        string platformInfo = $"Running on: {SystemInfo.operatingSystem} ({Application.platform})";
+        if (platformInfoText != null)
+            platformInfoText.text = platformInfo;
+        Debug.Log($"[TherapistUIController] {platformInfo}");
     }
 
     private enum StatusType { Info, Success, Error }
@@ -99,6 +112,15 @@ public class TherapistUIController : MonoBehaviour
             SetStatus(success ? $"Saved results to: {result}" : $"Failed to fetch results: {result}",
                 success ? StatusType.Success : StatusType.Error);
         });
+    }
+
+    private void OnExitClicked()
+    {
+        Debug.Log("[TherapistUIController] Exit requested — closing application.");
+        Application.Quit();
+#if UNITY_EDITOR
+        UnityEditor.EditorApplication.isPlaying = false;
+#endif
     }
 
     private void OnBrowseFolderClicked()
