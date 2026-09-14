@@ -47,10 +47,36 @@ public class TherapistUIController : MonoBehaviour
         // Small on-screen readout so it's obvious which OS a given build is actually
         // running as during cross-platform testing with real headsets — no need to dig
         // through logs or remember which machine you're looking at.
-        string platformInfo = $"Running on: {SystemInfo.operatingSystem} ({Application.platform})";
-        if (platformInfoText != null)
-            platformInfoText.text = platformInfo;
-        Debug.Log($"[TherapistUIController] {platformInfo}");
+        basePlatformInfo = $"Running on: {SystemInfo.operatingSystem} ({Application.platform})";
+        Debug.Log($"[TherapistUIController] {basePlatformInfo}");
+        RefreshPlatformInfoText();
+    }
+
+    // This app now hosts the TCP server the VR headset connects to (see VRAppClient.cs), so the
+    // therapist needs to know which IP/port to point the headset at, and whether it's actually
+    // connected. Polled here rather than event-driven because the connection state changes on a
+    // background accept thread — cheap enough to just re-render every frame off a bool compare.
+    private string basePlatformInfo;
+    private bool lastKnownVrAppConnected;
+
+    private void Update()
+    {
+        bool connected = vrAppClient != null && vrAppClient.IsVrAppConnected;
+        if (connected != lastKnownVrAppConnected)
+        {
+            lastKnownVrAppConnected = connected;
+            RefreshPlatformInfoText();
+        }
+    }
+
+    private void RefreshPlatformInfoText()
+    {
+        if (platformInfoText == null)
+            return;
+
+        string serverAddress = vrAppClient != null ? vrAppClient.GetServerAddressDisplay() : "n/a";
+        string connectionStatus = lastKnownVrAppConnected ? "VR headset: connected" : "VR headset: waiting for connection...";
+        platformInfoText.text = $"{basePlatformInfo}\nServer listening on: {serverAddress}\n{connectionStatus}";
     }
 
     private enum StatusType { Info, Success, Error }
@@ -135,8 +161,13 @@ public class TherapistUIController : MonoBehaviour
         {
             saveFolderPathField.text = selected;
         }
+#elif UNITY_STANDALONE_WIN
+        if (WindowsFolderBrowser.TryBrowseForFolder("Choose Save Folder", out string selectedFolder) && saveFolderPathField != null)
+        {
+            saveFolderPathField.text = selectedFolder;
+        }
 #else
-        SetStatus("Folder browsing is only available in the Unity Editor. Type or paste a folder path above instead.", StatusType.Info);
+        SetStatus("Folder browsing isn't available on this platform. Type or paste a folder path above instead.", StatusType.Info);
 #endif
     }
 
