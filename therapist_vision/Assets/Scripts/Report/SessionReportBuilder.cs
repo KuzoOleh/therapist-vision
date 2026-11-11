@@ -200,7 +200,7 @@ namespace TherapistVision.Reports
                 (data.DurationSeconds > 0 ? FormatClock(data.DurationSeconds) : "—", "тривалість сесії"),
                 (data.InstrumentHits.Count.ToString(CultureInfo.InvariantCulture), "ударів / струшувань"),
                 (instruments.Count.ToString(CultureInfo.InvariantCulture), "інструментів задіяно"),
-                (data.SequencerPresses.Count.ToString(CultureInfo.InvariantCulture), "запусків у секвенсорі"),
+                (data.SequencerStarts.Count.ToString(CultureInfo.InvariantCulture), "запусків у секвенсорі"),
                 ($"{(data.LusherFirst.Count > 0 ? 1 : 0) + (data.LusherSecond.Count > 0 ? 1 : 0)} з 2", "тести Люшера"),
             };
 
@@ -224,7 +224,7 @@ namespace TherapistVision.Reports
         {
             SectionTitle("1. Хронологія сесії",
                 timed
-                    ? "Кожна дія пацієнта на спільній шкалі часу. Висота риски — сила удару; квадрати — вибір кольору в тесті Люшера (у кольорі вибору)."
+                    ? "Кожна дія пацієнта на спільній шкалі часу. Висота риски — сила удару; квадрати — вибір кольору в тесті Люшера (у кольорі вибору); смуги — коли звучали петлі секвенсора та йшов запис звуку."
                     : "Дії пацієнта за порядком виконання (у файлі немає часу подій). Висота риски — сила удару.");
 
             var lanes = new List<Lane>();
@@ -250,8 +250,25 @@ namespace TherapistVision.Reports
                     {
                         Label = "Секвенсор",
                         Swatch = Ink2,
-                        Events = data.SequencerPresses.Where(p => p.Time.HasValue)
+                        CountText = data.SequencerStarts.Count.ToString(CultureInfo.InvariantCulture),
+                        Intervals = MergeIntervals(ComputeLoopIntervals(duration).Select(l => (l.Start, l.End)))
+                            .Select(r => new LaneInterval { Start = r.Item1, End = r.Item2, Color = Ink2.Tint(0.65f) }).ToList(),
+                        Events = data.SequencerStarts.Where(p => p.Time.HasValue)
                             .Select(p => new LaneEvent { X = p.Time.Value, Color = Ink2, Strength = 1f })
+                            .ToList()
+                    });
+                }
+
+                if (data.RecordingEvents.Count > 0)
+                {
+                    lanes.Add(new Lane
+                    {
+                        Label = "Запис (Record)",
+                        Swatch = Ink,
+                        CountText = "",
+                        Intervals = ComputeRecordingIntervals(duration).Select(r => new LaneInterval { Start = r.start, End = r.end, Color = Ink2 }).ToList(),
+                        Events = data.RecordingEvents.Where(r => r.Time.HasValue)
+                            .Select(r => new LaneEvent { X = r.Time.Value, Color = Ink, Strength = 0.35f })
                             .ToList()
                     });
                 }
@@ -529,84 +546,242 @@ namespace TherapistVision.Reports
 
         // ============================================================== 3. sequencer
 
+        private sealed class LoopInterval
+        {
+            public string Button;
+            public string Group;
+            public float Start;
+            public float End;
+        }
+
+        // Rebuilds when each loop was sounding from the start / stop / resume presses:
+        // start opens a loop, stop marks where it ends (on the next beat — the press time is
+        // used as the closest known value), resume cancels that stop. A loop still open at
+        // the end of the session runs until the session ends.
+        private List<LoopInterval> ComputeLoopIntervals(float sessionEnd)
+        {
+            var result = new List<LoopInterval>();
+            foreach (var button in data.SequencerPresses.Where(p => p.Time.HasValue)
+                         .GroupBy(p => (p.Button, Group: GroupName(p))))
+            {
+                float? openedAt = null;
+                float? stopAt = null;
+                foreach (var press in button.OrderBy(p => p.Time.Value).ThenBy(p => p.Index))
+                {
+                    float t = press.Time.Value;
+                    switch (press.Action)
+                    {
+                        case "start":
+                            if (openedAt.HasValue)
+                                result.Add(new LoopInterval { Button = button.Key.Button, Group = button.Key.Group, Start = openedAt.Value, End = stopAt ?? t });
+                            openedAt = t;
+                            stopAt = null;
+                            break;
+                        case "stop":
+                            if (openedAt.HasValue) stopAt = t;
+                            break;
+                        case "resume":
+                            stopAt = null;
+                            break;
+                    }
+                }
+                if (openedAt.HasValue)
+                {
+                    float end = stopAt ?? Math.Max(sessionEnd, openedAt.Value);
+                    result.Add(new LoopInterval { Button = button.Key.Button, Group = button.Key.Group, Start = openedAt.Value, End = end });
+                }
+            }
+            return result;
+        }
+
+        // Periods when the Record button was actually capturing audio (started → stopped).
+        private List<(float start, float end)> ComputeRecordingIntervals(float sessionEnd)
+        {
+            var result = new List<(float, float)>();
+            float? startedAt = null;
+            foreach (var e in data.RecordingEvents.Where(r => r.Time.HasValue).OrderBy(r => r.Time.Value))
+            {
+                if (e.Event == "started") startedAt = e.Time.Value;
+                else if (e.Event == "stopped" && startedAt.HasValue)
+                {
+                    result.Add((startedAt.Value, e.Time.Value));
+                    startedAt = null;
+                }
+            }
+            if (startedAt.HasValue) result.Add((startedAt.Value, Math.Max(sessionEnd, startedAt.Value)));
+            return result;
+        }
+
         private void DrawSequencerSection()
         {
             SectionTitle("3. Секвенсор",
-                "Запуски музичних петель на панелі секвенсора (фіксуються, коли ввімкнено запис кнопкою Record).");
+                "Запуски та зупинки музичних петель на панелі секвенсора, а також використання кнопки запису звуку (Record).");
 
-            if (data.SequencerPresses.Count == 0)
+            var starts = data.SequencerStarts;
+            if (data.SequencerPresses.Count == 0 && data.RecordingEvents.Count == 0)
             {
-                Note("Секвенсор у цій сесії не використовувався або запис не було ввімкнено.");
+                Note("Секвенсор у цій сесії не використовувався.");
                 return;
             }
 
-            // 3.1 per button
+            bool sequencerTimed = data.SequencerPresses.Any(p => p.Time.HasValue) || data.RecordingEvents.Any(r => r.Time.HasValue);
+            float sessionEnd = data.IsLegacyFormat
+                ? Math.Max(1f, data.SequencerPresses.Max(p => p.Time ?? 0f))
+                : duration;
+            // Old CSVs have no stop presses, so how long a loop sounded can't be known there.
+            List<LoopInterval> loops = sequencerTimed && !data.IsLegacyFormat ? ComputeLoopIntervals(sessionEnd) : new List<LoopInterval>();
+
+            DrawRecordingSummary();
+
             var buttons = data.SequencerPresses.GroupBy(p => (button: p.Button, group: GroupName(p)))
-                .OrderByDescending(g => g.Count()).ThenBy(g => g.Key.group, StringComparer.Ordinal).ThenBy(g => g.Key.button, StringComparer.Ordinal)
+                .OrderByDescending(g => g.Count(p => p.IsStart)).ThenBy(g => g.Key.group, StringComparer.Ordinal).ThenBy(g => g.Key.button, StringComparer.Ordinal)
                 .Select(g => g.Key).ToList();
+            string ButtonLabel((string button, string group) b) => b.group == b.button ? b.button : $"{b.button} ({b.group})";
 
-            ChartTitle("Запуски кожної кнопки", "Колір — група звуків.");
-            DrawHorizontalBars(buttons.Select(b => new BarItem
+            if (starts.Count > 0)
             {
-                Label = b.group == b.button ? b.button : $"{b.button} ({b.group})",
-                Value = data.SequencerPresses.Count(p => p.Button == b.button && GroupName(p) == b.group),
-                Color = groupColors[b.group]
-            }).ToList(), v => v.ToString("0", CultureInfo.InvariantCulture), fixedMax: null);
-            DrawLegend(sequencerGroups.Select(g => (g, groupColors[g], false)).ToList());
-
-            // 3.2 per group
-            if (sequencerGroups.Count > 1)
-            {
-                ChartTitle("Запуски за групами звуків", null);
-                DrawHorizontalBars(sequencerGroups.Select(g => new BarItem
+                // 3.1 launches per button
+                ChartTitle("Запуски кожної кнопки", "Скільки разів пацієнт запускав петлю. Колір — група звуків.");
+                DrawHorizontalBars(buttons.Select(b => new BarItem
                 {
-                    Label = g,
-                    Value = data.SequencerPresses.Count(p => GroupName(p) == g),
-                    Color = groupColors[g]
+                    Label = ButtonLabel(b),
+                    Value = starts.Count(p => p.Button == b.button && GroupName(p) == b.group),
+                    Color = groupColors[b.group]
                 }).ToList(), v => v.ToString("0", CultureInfo.InvariantCulture), fixedMax: null);
-            }
+                DrawLegend(sequencerGroups.Select(g => (g, groupColors[g], false)).ToList());
 
-            // 3.3 per mood
-            var moods = data.SequencerPresses.GroupBy(p => string.IsNullOrWhiteSpace(p.Mood) ? "без позначки" : p.Mood)
-                .OrderByDescending(g => g.Count()).ToList();
-            if (moods.Count > 0)
-            {
+                // 3.2 how long each loop sounded
+                if (loops.Count > 0)
+                {
+                    ChartTitle("Скільки звучала кожна петля",
+                        "Сумарний час від запуску до натискання «стоп» (або до кінця сесії, якщо петлю не зупинили).");
+                    var playing = buttons.Select(b => new BarItem
+                    {
+                        Label = ButtonLabel(b),
+                        Value = loops.Where(l => l.Button == b.button && l.Group == b.group).Sum(l => l.End - l.Start),
+                        Color = groupColors[b.group]
+                    }).Where(i => i.Value > 0).OrderByDescending(i => i.Value).ToList();
+                    DrawHorizontalBars(playing, v => FormatClock(v), fixedMax: null, timeAxis: true);
+                }
+
+                // 3.3 per group
+                if (sequencerGroups.Count > 1)
+                {
+                    ChartTitle("Запуски за групами звуків", null);
+                    DrawHorizontalBars(sequencerGroups.Select(g => new BarItem
+                    {
+                        Label = g,
+                        Value = starts.Count(p => GroupName(p) == g),
+                        Color = groupColors[g]
+                    }).Where(i => i.Value > 0).ToList(), v => v.ToString("0", CultureInfo.InvariantCulture), fixedMax: null);
+                }
+
+                // 3.4 per mood
+                var moods = starts.GroupBy(p => string.IsNullOrWhiteSpace(p.Mood) ? "без позначки" : p.Mood)
+                    .OrderByDescending(g => g.Count()).ToList();
                 ChartTitle("Настрій обраних звуків", "Скільки разів запускалися звуки з кожною позначкою настрою.");
                 DrawHorizontalBars(moods.Select(g => new BarItem { Label = g.Key, Value = g.Count(), Color = Accent }).ToList(),
                     v => v.ToString("0", CultureInfo.InvariantCulture), fixedMax: null);
             }
 
-            // 3.4 timeline per button
-            bool sequencerTimed = data.SequencerPresses.Any(p => p.Time.HasValue);
-            ChartTitle(sequencerTimed ? "Коли запускалася кожна кнопка" : "Порядок запусків",
-                data.IsLegacyFormat && sequencerTimed ? "Час відраховано від першого натискання на секвенсорі." : null);
-
+            // 3.5 timeline: loops + Record
             // Zoom into the part of the session where the sequencer was actually used — on the
             // full-session scale a few minutes of presses collapse into one cluster.
             float xMin = 0f;
-            float xMax = data.SequencerPresses.Count;
+            float xMax = Math.Max(1, data.SequencerPresses.Count);
             if (sequencerTimed)
             {
-                float first = data.SequencerPresses.Where(p => p.Time.HasValue).Min(p => p.Time.Value);
-                float last = data.SequencerPresses.Where(p => p.Time.HasValue).Max(p => p.Time.Value);
+                var times = data.SequencerPresses.Where(p => p.Time.HasValue).Select(p => p.Time.Value)
+                    .Concat(data.RecordingEvents.Where(r => r.Time.HasValue).Select(r => r.Time.Value))
+                    .Concat(loops.Select(l => l.End)).ToList();
+                float first = times.Min();
+                float last = times.Max();
                 float pad = Math.Max(5f, (last - first) * 0.08f);
                 xMin = Math.Max(0f, first - pad);
                 xMax = Math.Max(xMin + 20f, last + pad);
                 if (!data.IsLegacyFormat) xMax = Math.Min(xMax, Math.Max(duration, last));
             }
 
-            var lanes = buttons.Select(b => new Lane
+            var lanes = new List<Lane>();
+            if (sequencerTimed && data.RecordingEvents.Count > 0)
             {
-                Label = b.group == b.button ? b.button : $"{b.button} ({b.group})",
-                Swatch = groupColors[b.group],
-                Events = data.SequencerPresses
-                    .Where(p => p.Button == b.button && GroupName(p) == b.group)
-                    .Select(p => new LaneEvent { X = sequencerTimed ? (p.Time ?? 0f) : p.Index, Color = groupColors[b.group], Strength = 1f })
-                    .ToList()
-            }).ToList();
+                lanes.Add(new Lane
+                {
+                    Label = "Запис (Record)",
+                    Swatch = Ink,
+                    CountText = "",
+                    Intervals = ComputeRecordingIntervals(sessionEnd).Select(r => new LaneInterval { Start = r.start, End = r.end, Color = Ink2 }).ToList(),
+                    Events = data.RecordingEvents.Where(r => r.Time.HasValue)
+                        .Select(r => new LaneEvent { X = r.Time.Value, Color = Ink, Strength = r.Event == "started" || r.Event == "stopped" ? 1f : 0.35f })
+                        .ToList()
+                });
+            }
+
+            foreach (var b in buttons)
+            {
+                var presses = data.SequencerPresses.Where(p => p.Button == b.button && GroupName(p) == b.group).ToList();
+                PdfColor color = groupColors[b.group];
+                lanes.Add(new Lane
+                {
+                    Label = ButtonLabel(b),
+                    Swatch = color,
+                    CountText = presses.Count(p => p.IsStart).ToString(CultureInfo.InvariantCulture),
+                    Intervals = loops.Where(l => l.Button == b.button && l.Group == b.group)
+                        .Select(l => new LaneInterval { Start = l.Start, End = l.End, Color = color.Tint(0.55f) }).ToList(),
+                    Events = presses.Where(p => p.Action != "resume")
+                        .Select(p => new LaneEvent
+                        {
+                            X = sequencerTimed ? (p.Time ?? 0f) : p.Index,
+                            Color = p.IsStart ? color : Ink2,
+                            Strength = p.IsStart ? 1f : 0.3f
+                        })
+                        .ToList()
+                });
+            }
+
+            bool hasRecordLane = sequencerTimed && data.RecordingEvents.Count > 0;
+            ChartTitle(sequencerTimed ? "Коли звучала кожна петля" : "Порядок запусків",
+                sequencerTimed
+                    ? (data.IsLegacyFormat ? "Риска — запуск петлі." : "Смуга — петля звучала; висока риска — запуск; коротка темна риска — натиснуто «стоп».") +
+                      (hasRecordLane ? " Верхній рядок — запис звуку кнопкою Record." : "") +
+                      (data.IsLegacyFormat ? " Час відраховано від першого натискання на секвенсорі." : "")
+                    : null,
+                keepWith: Math.Min(lanes.Count, 3) * 20f + 40f);
 
             DrawLaneChart(lanes, xMin, xMax, isTime: sequencerTimed,
-                axisCaption: sequencerTimed ? (data.IsLegacyFormat ? "час від першого натискання, хв:с" : "час від початку сесії, хв:с") : "порядковий номер запуску");
+                axisCaption: sequencerTimed ? (data.IsLegacyFormat ? "час від першого натискання, хв:с" : "час від початку сесії, хв:с") : "порядковий номер натискання");
+        }
+
+        // One plain-language line about the Record button, so it's clear whether the sound of
+        // the session was saved.
+        private void DrawRecordingSummary()
+        {
+            if (data.RecordingEvents.Count == 0)
+            {
+                if (!data.IsLegacyFormat)
+                    Paragraph("Кнопку запису Record пацієнт не натискав — звук секвенсора не записувався. Натискання кнопок зафіксовано повністю.", 8.5f, Ink2);
+                return;
+            }
+
+            var parts = new List<string>();
+            foreach (var e in data.RecordingEvents.OrderBy(r => r.Time ?? 0f))
+            {
+                string at = e.Time.HasValue ? $" о {FormatClock(e.Time.Value)}" : "";
+                switch (e.Event)
+                {
+                    case "armed": parts.Add($"Record натиснуто{at}"); break;
+                    case "started": parts.Add($"запис почався{at} (з першою петлею)"); break;
+                    case "stopped": parts.Add($"запис зупинено{at}" + (string.IsNullOrEmpty(e.FileName) ? "" : $", файл {e.FileName}")); break;
+                    case "cancelled": parts.Add($"запис скасовано до початку{at}"); break;
+                    default: parts.Add(e.Event + at); break;
+                }
+            }
+
+            bool stillRecording = data.RecordingEvents.Any(r => r.Event == "started") &&
+                                  data.RecordingEvents.Last(r => r.Event == "started" || r.Event == "stopped").Event == "started";
+            string text = "Запис звуку: " + string.Join("; ", parts) + ".";
+            if (stillRecording) text += " Запис не було зупинено до кінця сесії — WAV-файл міг не зберегтися.";
+            Paragraph(text, 8.5f, Ink2);
         }
 
         // ================================================================ 4. Lüscher
@@ -817,7 +992,29 @@ namespace TherapistVision.Reports
         {
             public string Label;
             public PdfColor Swatch;
+            public string CountText;   // null → number of events
             public List<LaneEvent> Events = new List<LaneEvent>();
+            public List<LaneInterval> Intervals = new List<LaneInterval>();
+        }
+
+        private sealed class LaneInterval
+        {
+            public float Start;
+            public float End;
+            public PdfColor Color;
+        }
+
+        private static List<(float, float)> MergeIntervals(IEnumerable<(float start, float end)> intervals)
+        {
+            var merged = new List<(float, float)>();
+            foreach (var i in intervals.OrderBy(i => i.start))
+            {
+                if (merged.Count > 0 && i.start <= merged[merged.Count - 1].Item2)
+                    merged[merged.Count - 1] = (merged[merged.Count - 1].Item1, Math.Max(merged[merged.Count - 1].Item2, i.end));
+                else
+                    merged.Add((i.start, i.end));
+            }
+            return merged;
         }
 
         private sealed class LaneEvent
@@ -861,7 +1058,17 @@ namespace TherapistVision.Reports
                     float laneTop = top + i * laneH;
                     page.FillRect(Margin + 2, laneTop + laneH / 2 - 3, 6, 6, lane.Swatch);
                     page.Text(page.Fit(lane.Label, 8.5f, LabelColumnW - 34), Margin + 12, laneTop + laneH / 2 + 3, 8.5f, Ink);
-                    page.Text(lane.Events.Count.ToString(CultureInfo.InvariantCulture), Margin + LabelColumnW - 6, laneTop + laneH / 2 + 3, 7.5f, Muted, align: TextAlign.Right);
+                    page.Text(lane.CountText ?? lane.Events.Count.ToString(CultureInfo.InvariantCulture), Margin + LabelColumnW - 6, laneTop + laneH / 2 + 3, 7.5f, Muted, align: TextAlign.Right);
+
+                    if (isTime)
+                    {
+                        foreach (LaneInterval interval in lane.Intervals)
+                        {
+                            float x1 = MapX(interval.Start, xMin, xMax, plotX, plotW, true);
+                            float x2 = MapX(interval.End, xMin, xMax, plotX, plotW, true);
+                            page.FillRoundedRect(x1, laneTop + laneH * 0.32f, Math.Max(1.5f, x2 - x1), laneH * 0.36f, 2f, interval.Color);
+                        }
+                    }
 
                     float laneBottom = laneTop + laneH - 3;
                     foreach (LaneEvent e in lane.Events)
@@ -886,19 +1093,20 @@ namespace TherapistVision.Reports
             });
         }
 
-        private void DrawHorizontalBars(List<BarItem> items, Func<float, string> format, float? fixedMax)
+        // timeAxis: values are seconds — ticks land on round minutes/seconds and print as m:ss.
+        private void DrawHorizontalBars(List<BarItem> items, Func<float, string> format, float? fixedMax, bool timeAxis = false)
         {
             if (items.Count == 0) return;
             const float rowH = 18f;
             const float barH = 10f;
             float plotX = Margin + LabelColumnW;
             float plotW = ContentW - LabelColumnW - 40;
-            float max = fixedMax ?? NiceCeiling(Math.Max(1f, items.Max(i => i.Value)));
+            float max = fixedMax ?? (timeAxis ? TimeCeiling(items.Max(i => i.Value)) : NiceCeiling(Math.Max(1f, items.Max(i => i.Value))));
 
             Chunked(items.Count, rowH, 20, (start, count, top) =>
             {
                 float chartBottom = top + count * rowH;
-                DrawValueGrid(plotX, top, plotW, chartBottom - top, max, format, integerTicks: true); // bar charts here are all counts
+                DrawValueGrid(plotX, top, plotW, chartBottom - top, max, format, integerTicks: true, timeAxis: timeAxis); // counts or seconds
 
                 for (int r = 0; r < count; r++)
                 {
@@ -913,9 +1121,9 @@ namespace TherapistVision.Reports
         }
 
         // Vertical gridlines + labels for a horizontal value axis (bars start at 0).
-        private void DrawValueGrid(float plotX, float top, float plotW, float height, float max, Func<float, string> format, bool integerTicks)
+        private void DrawValueGrid(float plotX, float top, float plotW, float height, float max, Func<float, string> format, bool integerTicks, bool timeAxis = false)
         {
-            float step = NiceStep(max, 5, integer: integerTicks);
+            float step = timeAxis ? TimeStep(max) : NiceStep(max, 5, integer: integerTicks);
             for (float v = 0; v <= max + step * 0.01f; v += step)
             {
                 float gx = plotX + plotW * v / max;
@@ -1151,6 +1359,20 @@ namespace TherapistVision.Reports
             double step = new[] { 1, 2, 2.5, 5, 10 }.Select(m => m * magnitude).First(s => s >= raw);
             if (integer) step = Math.Max(1, Math.Ceiling(step));
             return (float)step;
+        }
+
+        private static float TimeStep(float span)
+        {
+            float[] steps = { 1, 2, 5, 10, 15, 20, 30, 60, 120, 180, 300, 600, 900, 1200, 1800, 3600 };
+            float step = steps.FirstOrDefault(s => span / s <= 6f);
+            return step > 0 ? step : (float)Math.Ceiling(span / 6f);
+        }
+
+        private static float TimeCeiling(float max)
+        {
+            max = Math.Max(1f, max);
+            float step = TimeStep(max);
+            return (float)Math.Ceiling(max / step - 1e-6) * step;
         }
 
         private static float NiceCeiling(float max)

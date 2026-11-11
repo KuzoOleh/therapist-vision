@@ -28,6 +28,17 @@ namespace TherapistVision.Reports
         public string Button;
         public string Group;
         public string Mood;
+        public string Action = "start"; // start / stop / resume
+        public float? Time;
+
+        public bool IsStart => Action == "start";
+    }
+
+    // Record button on the sequencer panel: armed → started → stopped, or armed → cancelled.
+    public sealed class RecordingEvent
+    {
+        public string Event;
+        public string FileName;
         public float? Time;
     }
 
@@ -40,6 +51,10 @@ namespace TherapistVision.Reports
         public readonly List<ColorChoice> LusherFirst = new List<ColorChoice>();
         public readonly List<ColorChoice> LusherSecond = new List<ColorChoice>();
         public readonly List<SequencerPress> SequencerPresses = new List<SequencerPress>();
+        public readonly List<RecordingEvent> RecordingEvents = new List<RecordingEvent>();
+
+        // Loop launches only (the stop / resume presses are kept in SequencerPresses too).
+        public List<SequencerPress> SequencerStarts => SequencerPresses.Where(p => p.IsStart).ToList();
 
         public string SourceFileName = "";
 
@@ -68,6 +83,7 @@ namespace TherapistVision.Reports
                 float max = 0f;
                 foreach (var h in InstrumentHits) if (h.Time > max) max = h.Time.Value;
                 foreach (var p in SequencerPresses) if (p.Time > max) max = p.Time.Value;
+                foreach (var r in RecordingEvents) if (r.Time > max) max = r.Time.Value;
                 foreach (var c in LusherFirst) if (c.Time > max) max = c.Time.Value;
                 foreach (var c in LusherSecond) if (c.Time > max) max = c.Time.Value;
                 return max;
@@ -145,14 +161,20 @@ namespace TherapistVision.Reports
                         data.LusherSecond.Add(new ColorChoice { Position = index > 0 ? index : data.LusherSecond.Count + 1, Color = item, Time = time });
                         break;
                     case "sequencer":
+                    case "sequencer_stop":
+                    case "sequencer_resume":
                         data.SequencerPresses.Add(new SequencerPress
                         {
                             Index = index > 0 ? index : data.SequencerPresses.Count + 1,
                             Button = item,
                             Group = detail,
                             Mood = value,
+                            Action = section == "sequencer" ? "start" : section.Substring("sequencer_".Length),
                             Time = time
                         });
+                        break;
+                    case "sequencer_record":
+                        data.RecordingEvents.Add(new RecordingEvent { Event = item.ToLowerInvariant(), FileName = value, Time = time });
                         break;
                     // instrument_summary is derived data — the report recomputes it from the hits.
                 }
