@@ -1,5 +1,9 @@
 using System;
+using System.Collections;
 using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using TherapistVision.Reports;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -26,17 +30,35 @@ public class TherapistUIController : MonoBehaviour
     [SerializeField] private TMP_InputField saveFolderPathField;
     [SerializeField] private Button browseFolderButton;
 
+    [Header("PDF Report")]
+    [Tooltip("Builds a PDF report from any session CSV the therapist picks. Left empty, a button is created at runtime by cloning the Fetch Data button.")]
+    [SerializeField] private Button reportFromFileButton;
+    [Tooltip("Opens the last generated PDF report in the system PDF viewer. Left empty, a button is created at runtime by cloning the Fetch Data button.")]
+    [SerializeField] private Button openReportButton;
+    [Tooltip("Font embedded into the PDF, relative to StreamingAssets. Must contain Cyrillic glyphs.")]
+    [SerializeField] private string reportFontPath = "Fonts/LiberationSans.ttf";
+    [Tooltip("Open the PDF automatically as soon as it has been generated.")]
+    [SerializeField] private bool openReportAutomatically = false;
+    [Tooltip("Where the runtime-created report buttons go, in the Fetch Data button's parent space.")]
+    [SerializeField] private Vector2 reportFromFileButtonPosition = new Vector2(-120f, -185f);
+    [SerializeField] private Vector2 openReportButtonPosition = new Vector2(120f, -185f);
+    [SerializeField] private Vector2 runtimeReportButtonSize = new Vector2(220f, 46f);
+
+    private string lastReportPath;
+    private bool reportInProgress;
+
     private void Awake()
     {
         startSessionButton.onClick.AddListener(OnStartSessionClicked);
         fetchResultsButton.onClick.AddListener(OnFetchResultsClicked);
-        fetchResultsButton.interactable = false;
 
         if (exitButton != null)
             exitButton.onClick.AddListener(OnExitClicked);
 
         if (browseFolderButton != null)
             browseFolderButton.onClick.AddListener(OnBrowseFolderClicked);
+
+        SetUpReportButtons();
 
         if (sessionDateField != null && string.IsNullOrEmpty(sessionDateField.text))
             sessionDateField.text = DateTime.Now.ToString("yyyy-MM-dd");
@@ -52,31 +74,59 @@ public class TherapistUIController : MonoBehaviour
         RefreshPlatformInfoText();
     }
 
-    // This app now hosts the TCP server the VR headset connects to (see VRAppClient.cs), so the
-    // therapist needs to know which IP/port to point the headset at, and whether it's actually
-    // connected. Polled here rather than event-driven because the connection state changes on a
-    // background accept thread — cheap enough to just re-render every frame off a bool compare.
+    // Connection state changes on network threads, so it's polled here and the header text /
+    // buttons are refreshed whenever something the therapist should see changes.
     private string basePlatformInfo;
-    private bool lastKnownVrAppConnected;
+    private string lastPlatformInfo;
+    private float waitingSince;
+
+    [Header("Connection Help")]
+    [Tooltip("After this many seconds without a headset, show a hint about Wi-Fi / Windows Firewall.")]
+    [SerializeField] private float firewallHintAfterSeconds = 20f;
 
     private void Update()
     {
         bool connected = vrAppClient != null && vrAppClient.IsVrAppConnected;
-        if (connected != lastKnownVrAppConnected)
-        {
-            lastKnownVrAppConnected = connected;
-            RefreshPlatformInfoText();
-        }
+        bool busy = vrAppClient == null || vrAppClient.IsBusy;
+
+        // Start / Fetch are available whenever a headset is connected — also after
+        // TherapistVision was restarted mid-session.
+        startSessionButton.interactable = connected && !busy;
+        fetchResultsButton.interactable = connected && !busy;
+
+        if (connected) waitingSince = Time.unscaledTime;
+        RefreshPlatformInfoText();
     }
 
     private void RefreshPlatformInfoText()
     {
-        if (platformInfoText == null)
+        if (platformInfoText == null || vrAppClient == null)
             return;
 
-        string serverAddress = vrAppClient != null ? vrAppClient.GetServerAddressDisplay() : "n/a";
-        string connectionStatus = lastKnownVrAppConnected ? "VR headset: connected" : "VR headset: waiting for connection...";
-        platformInfoText.text = $"{basePlatformInfo}\nServer listening on: {serverAddress}\n{connectionStatus}";
+        string text = $"{basePlatformInfo}\nServer listening on: {vrAppClient.GetServerAddressDisplay()}\n";
+        string error = vrAppClient.NetworkError;
+
+        if (vrAppClient.IsVrAppConnected)
+        {
+            text += $"VR headset: connected ({vrAppClient.ConnectedDeviceName})";
+        }
+        else
+        {
+            text += "VR headset: waiting for connection...";
+            if (string.IsNullOrEmpty(error) && Time.unscaledTime - waitingSince > firewallHintAfterSeconds)
+            {
+                text += "\nNot connecting? Put the headset on the same Wi-Fi and allow TherapistVision in Windows Firewall (Private networks).";
+            }
+        }
+
+        if (!string.IsNullOrEmpty(error))
+            text += $"\n<color=#ff6b6b>{error}</color>";
+
+        if (text != lastPlatformInfo)
+        {
+            platformInfoText.text = text;
+            lastPlatformInfo = text;
+        }
     }
 
     private enum StatusType { Info, Success, Error }
@@ -106,19 +156,20 @@ public class TherapistUIController : MonoBehaviour
         };
 
         SetStatus("Sending session info to VR app...", StatusType.Info);
-        startSessionButton.interactable = false;
 
         vrAppClient.SendSessionInfo(info, (success, message) =>
         {
-            startSessionButton.interactable = true;
-            if (success)
+            if (!success)
             {
-                SetStatus("Session started. Waiting for it to finish, then fetch results.", StatusType.Success);
-                fetchResultsButton.interactable = true;
+                SetStatus($"Failed to start the session: {message}", StatusType.Error);
+            }
+            else if (message == "queued")
+            {
+                SetStatus("Session info delivered. The headset is asleep — the session starts as soon as it's put on.", StatusType.Success);
             }
             else
             {
-                SetStatus($"Failed to reach VR app: {message}", StatusType.Error);
+                SetStatus("Session started. When the patient has finished, fetch the results.", StatusType.Success);
             }
         });
     }
@@ -126,19 +177,179 @@ public class TherapistUIController : MonoBehaviour
     private void OnFetchResultsClicked()
     {
         SetStatus("Fetching session results...", StatusType.Info);
-        fetchResultsButton.interactable = false;
 
-        string exportPath = saveFolderPathField != null && !string.IsNullOrWhiteSpace(saveFolderPathField.text)
+        string exportPath = GetExportFolder();
+
+        vrAppClient.RequestSessionFiles(exportPath,
+            (fraction, detail) => SetStatus($"Receiving session files... {fraction * 100f:0}%\n{detail}", StatusType.Info),
+            (success, message, savedFiles) =>
+            {
+                if (!success)
+                {
+                    SetStatus($"Failed to fetch results: {message}", StatusType.Error);
+                    return;
+                }
+
+                string csvPath = savedFiles.FirstOrDefault(f => f.EndsWith(".csv", StringComparison.OrdinalIgnoreCase));
+                if (csvPath == null)
+                {
+                    SetStatus($"{message} — but no CSV among them, so no report was built. Folder: {exportPath}", StatusType.Error);
+                    return;
+                }
+
+                SetStatus($"{message} Saved to: {exportPath}\nBuilding PDF report...", StatusType.Info);
+                StartCoroutine(GenerateReportRoutine(csvPath));
+            });
+    }
+
+    // ------------------------------------------------------------------ PDF report
+
+    private void OnReportFromFileClicked()
+    {
+        if (reportInProgress) return;
+
+        string exportFolder = GetExportFolder();
+        CsvFilePicker.Result pick = CsvFilePicker.Pick(exportFolder, out string csvPath);
+
+        if (pick == CsvFilePicker.Result.Cancelled)
+            return;
+
+        if (pick == CsvFilePicker.Result.Unavailable)
+        {
+            // No file dialog on this system (e.g. Linux without zenity/kdialog): use the newest
+            // CSV in the export folder instead.
+            csvPath = FindNewestCsv(exportFolder);
+            if (csvPath == null)
+            {
+                SetStatus($"No file dialog available and no CSV files found in: {exportFolder}", StatusType.Error);
+                return;
+            }
+        }
+
+        SetStatus($"Building PDF report for {Path.GetFileName(csvPath)}...", StatusType.Info);
+        StartCoroutine(GenerateReportRoutine(csvPath));
+    }
+
+    private void OnOpenReportClicked()
+    {
+        if (string.IsNullOrEmpty(lastReportPath) || !File.Exists(lastReportPath))
+        {
+            SetStatus("No report to open yet — fetch results or build a report from a CSV first.", StatusType.Error);
+            return;
+        }
+
+        Application.OpenURL(new Uri(lastReportPath).AbsoluteUri);
+    }
+
+    // PDF generation is pure C# file work (no Unity API), so it runs on a worker thread to keep
+    // the UI responsive; the coroutine just waits for it and reports back on the main thread.
+    private IEnumerator GenerateReportRoutine(string csvPath)
+    {
+        reportInProgress = true;
+        SetReportButtonsInteractable(false);
+
+        string fontPath = Path.Combine(Application.streamingAssetsPath, reportFontPath);
+        Task<string> task = Task.Run(() => SessionReportGenerator.GenerateFromCsv(csvPath, null, fontPath));
+
+        while (!task.IsCompleted)
+        {
+            yield return null;
+        }
+
+        reportInProgress = false;
+
+        if (task.IsFaulted || task.IsCanceled)
+        {
+            Exception error = task.Exception?.GetBaseException();
+            Debug.LogError($"[TherapistUIController] PDF report failed for {csvPath}: {error}");
+            SetStatus($"Results saved to: {csvPath}\nPDF report failed: {error?.Message ?? "cancelled"}", StatusType.Error);
+            SetReportButtonsInteractable(true);
+            yield break;
+        }
+
+        lastReportPath = task.Result;
+        SetReportButtonsInteractable(true);
+        SetStatus($"Results: {csvPath}\nReport: {lastReportPath}", StatusType.Success);
+
+        if (openReportAutomatically)
+            OnOpenReportClicked();
+    }
+
+    private void SetReportButtonsInteractable(bool interactable)
+    {
+        if (reportFromFileButton != null)
+            reportFromFileButton.interactable = interactable;
+        if (openReportButton != null)
+            openReportButton.interactable = interactable && !string.IsNullOrEmpty(lastReportPath);
+    }
+
+    private void SetUpReportButtons()
+    {
+        if (reportFromFileButton == null)
+            reportFromFileButton = CloneButton(fetchResultsButton, "ReportFromCsv", "Report from CSV...", reportFromFileButtonPosition);
+        if (openReportButton == null)
+            openReportButton = CloneButton(fetchResultsButton, "OpenReport", "Open report", openReportButtonPosition);
+
+        if (reportFromFileButton != null)
+            reportFromFileButton.onClick.AddListener(OnReportFromFileClicked);
+        if (openReportButton != null)
+            openReportButton.onClick.AddListener(OnOpenReportClicked);
+
+        SetReportButtonsInteractable(true);
+    }
+
+    // Copies an existing scene button (so it inherits the scene's look) instead of requiring
+    // a manual scene edit. Assign real buttons in the Inspector to override this.
+    private Button CloneButton(Button template, string objectName, string label, Vector2 anchoredPosition)
+    {
+        if (template == null)
+            return null;
+
+        GameObject clone = Instantiate(template.gameObject, template.transform.parent);
+        clone.name = objectName;
+
+        var rect = clone.GetComponent<RectTransform>();
+        if (rect != null)
+        {
+            rect.anchoredPosition = anchoredPosition;
+            rect.sizeDelta = runtimeReportButtonSize;
+        }
+
+        var button = clone.GetComponent<Button>();
+        button.onClick = new Button.ButtonClickedEvent(); // drop any listeners copied from the template
+        button.interactable = true;
+
+        var text = clone.GetComponentInChildren<TMP_Text>();
+        if (text != null)
+        {
+            text.text = label;
+            text.enableAutoSizing = true;
+            text.fontSizeMin = 12;
+            text.fontSizeMax = 22;
+        }
+
+        return button;
+    }
+
+    private string GetExportFolder()
+    {
+        return saveFolderPathField != null && !string.IsNullOrWhiteSpace(saveFolderPathField.text)
             ? saveFolderPathField.text.Trim()
             : Path.Combine(Application.persistentDataPath, exportFolderName);
-
-        vrAppClient.RequestSessionCsv(exportPath, (success, result) =>
-        {
-            fetchResultsButton.interactable = true;
-            SetStatus(success ? $"Saved results to: {result}" : $"Failed to fetch results: {result}",
-                success ? StatusType.Success : StatusType.Error);
-        });
     }
+
+    private static string FindNewestCsv(string folder)
+    {
+        if (!Directory.Exists(folder))
+            return null;
+
+        return new DirectoryInfo(folder).GetFiles("*.csv")
+            .OrderByDescending(f => f.LastWriteTimeUtc)
+            .Select(f => f.FullName)
+            .FirstOrDefault();
+    }
+
+    // ------------------------------------------------------------------ misc
 
     private void OnExitClicked()
     {
