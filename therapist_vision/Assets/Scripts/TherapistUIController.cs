@@ -51,7 +51,6 @@ public class TherapistUIController : MonoBehaviour
     {
         startSessionButton.onClick.AddListener(OnStartSessionClicked);
         fetchResultsButton.onClick.AddListener(OnFetchResultsClicked);
-        fetchResultsButton.interactable = false;
 
         if (exitButton != null)
             exitButton.onClick.AddListener(OnExitClicked);
@@ -75,31 +74,59 @@ public class TherapistUIController : MonoBehaviour
         RefreshPlatformInfoText();
     }
 
-    // This app now hosts the TCP server the VR headset connects to (see VRAppClient.cs), so the
-    // therapist needs to know which IP/port to point the headset at, and whether it's actually
-    // connected. Polled here rather than event-driven because the connection state changes on a
-    // background accept thread — cheap enough to just re-render every frame off a bool compare.
+    // Connection state changes on network threads, so it's polled here and the header text /
+    // buttons are refreshed whenever something the therapist should see changes.
     private string basePlatformInfo;
-    private bool lastKnownVrAppConnected;
+    private string lastPlatformInfo;
+    private float waitingSince;
+
+    [Header("Connection Help")]
+    [Tooltip("After this many seconds without a headset, show a hint about Wi-Fi / Windows Firewall.")]
+    [SerializeField] private float firewallHintAfterSeconds = 20f;
 
     private void Update()
     {
         bool connected = vrAppClient != null && vrAppClient.IsVrAppConnected;
-        if (connected != lastKnownVrAppConnected)
-        {
-            lastKnownVrAppConnected = connected;
-            RefreshPlatformInfoText();
-        }
+        bool busy = vrAppClient == null || vrAppClient.IsBusy;
+
+        // Start / Fetch are available whenever a headset is connected — also after
+        // TherapistVision was restarted mid-session.
+        startSessionButton.interactable = connected && !busy;
+        fetchResultsButton.interactable = connected && !busy;
+
+        if (connected) waitingSince = Time.unscaledTime;
+        RefreshPlatformInfoText();
     }
 
     private void RefreshPlatformInfoText()
     {
-        if (platformInfoText == null)
+        if (platformInfoText == null || vrAppClient == null)
             return;
 
-        string serverAddress = vrAppClient != null ? vrAppClient.GetServerAddressDisplay() : "n/a";
-        string connectionStatus = lastKnownVrAppConnected ? "VR headset: connected" : "VR headset: waiting for connection...";
-        platformInfoText.text = $"{basePlatformInfo}\nServer listening on: {serverAddress}\n{connectionStatus}";
+        string text = $"{basePlatformInfo}\nServer listening on: {vrAppClient.GetServerAddressDisplay()}\n";
+        string error = vrAppClient.NetworkError;
+
+        if (vrAppClient.IsVrAppConnected)
+        {
+            text += $"VR headset: connected ({vrAppClient.ConnectedDeviceName})";
+        }
+        else
+        {
+            text += "VR headset: waiting for connection...";
+            if (string.IsNullOrEmpty(error) && Time.unscaledTime - waitingSince > firewallHintAfterSeconds)
+            {
+                text += "\nNot connecting? Put the headset on the same Wi-Fi and allow TherapistVision in Windows Firewall (Private networks).";
+            }
+        }
+
+        if (!string.IsNullOrEmpty(error))
+            text += $"\n<color=#ff6b6b>{error}</color>";
+
+        if (text != lastPlatformInfo)
+        {
+            platformInfoText.text = text;
+            lastPlatformInfo = text;
+        }
     }
 
     private enum StatusType { Info, Success, Error }
@@ -129,19 +156,20 @@ public class TherapistUIController : MonoBehaviour
         };
 
         SetStatus("Sending session info to VR app...", StatusType.Info);
-        startSessionButton.interactable = false;
 
         vrAppClient.SendSessionInfo(info, (success, message) =>
         {
-            startSessionButton.interactable = true;
-            if (success)
+            if (!success)
             {
-                SetStatus("Session started. Waiting for it to finish, then fetch results.", StatusType.Success);
-                fetchResultsButton.interactable = true;
+                SetStatus($"Failed to start the session: {message}", StatusType.Error);
+            }
+            else if (message == "queued")
+            {
+                SetStatus("Session info delivered. The headset is asleep — the session starts as soon as it's put on.", StatusType.Success);
             }
             else
             {
-                SetStatus($"Failed to reach VR app: {message}", StatusType.Error);
+                SetStatus("Session started. When the patient has finished, fetch the results.", StatusType.Success);
             }
         });
     }
@@ -149,22 +177,29 @@ public class TherapistUIController : MonoBehaviour
     private void OnFetchResultsClicked()
     {
         SetStatus("Fetching session results...", StatusType.Info);
-        fetchResultsButton.interactable = false;
 
         string exportPath = GetExportFolder();
 
-        vrAppClient.RequestSessionCsv(exportPath, (success, result) =>
-        {
-            fetchResultsButton.interactable = true;
-            if (!success)
+        vrAppClient.RequestSessionFiles(exportPath,
+            (fraction, detail) => SetStatus($"Receiving session files... {fraction * 100f:0}%\n{detail}", StatusType.Info),
+            (success, message, savedFiles) =>
             {
-                SetStatus($"Failed to fetch results: {result}", StatusType.Error);
-                return;
-            }
+                if (!success)
+                {
+                    SetStatus($"Failed to fetch results: {message}", StatusType.Error);
+                    return;
+                }
 
-            SetStatus($"Saved results to: {result}\nBuilding PDF report...", StatusType.Info);
-            StartCoroutine(GenerateReportRoutine(result));
-        });
+                string csvPath = savedFiles.FirstOrDefault(f => f.EndsWith(".csv", StringComparison.OrdinalIgnoreCase));
+                if (csvPath == null)
+                {
+                    SetStatus($"{message} — but no CSV among them, so no report was built. Folder: {exportPath}", StatusType.Error);
+                    return;
+                }
+
+                SetStatus($"{message} Saved to: {exportPath}\nBuilding PDF report...", StatusType.Info);
+                StartCoroutine(GenerateReportRoutine(csvPath));
+            });
     }
 
     // ------------------------------------------------------------------ PDF report
